@@ -1,18 +1,113 @@
-name: GitHub Actions zero2prod
-run-name: ${{ github.actor }} is zero2prod rust Actions 🚀
-on: [push]
+name: Rust CI/CD
+
+# 触发条件：main分支推送或PR，也可添加其他分支
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
 jobs:
-  Explore-GitHub-Actions:
-    runs-on: ubuntu-latest
+  quality-check:
+    name: Lint + Test + Coverage + Security
+    runs-on: ubuntu-latest  # 优先使用Ubuntu（工具支持最完善）
+    strategy:
+      fail-fast: false  # 某个步骤失败后不中断其他步骤（可选）
+      matrix:
+        # 可选：测试多个Rust版本（稳定版+测试版）
+        rust: [stable, beta]
+
     steps:
-      - run: echo "🎉 The job was automatically triggered by a ${{ github.event_name }} event."
-      - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by GitHub!"
-      - run: echo "🔎 The name of your branch is ${{ github.ref }} and your repository is ${{ github.repository }}."
-      - name: Check out repository code
-        uses: actions/checkout@v5
-      - run: echo "💡 The ${{ github.repository }} repository has been cloned to the runner."
-      - run: echo "🖥️ The workflow is now ready to test your code on the runner."
-      - name: List files in the repository
+      ###########################################################################
+      # 1. 检出代码 + 安装系统依赖（tarpaulin需要OpenSSL）
+      ###########################################################################
+      - name: Checkout repository
+        uses: actions/checkout@v4  # 检出当前仓库代码
+
+      - name: Install system dependencies
         run: |
-          ls ${{ github.workspace }}
-      - run: echo "🍏 This job's status is ${{ job.status }}."
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev  # tarpaulin依赖OpenSSL开发库
+
+      ###########################################################################
+      # 2. 配置Rust环境（指定版本+组件+缓存）
+      ###########################################################################
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}  # 对应matrix中的Rust版本
+          components: clippy  # 安装clippy（代码 lint 工具）
+          override: true  # 覆盖系统默认Rust版本
+          profile: minimal  # 最小化安装（加快速度）
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v3  # 缓存依赖，避免重复下载
+        with:
+          path: |
+            ~/.cargo/registry  # 依赖包缓存
+            ~/.cargo/git       # Git依赖缓存
+            target             # 编译产物缓存
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}  # 基于Cargo.lock哈希缓存
+          restore-keys: |
+            ${{ runner.os }}-cargo-  # 缓存未命中时的降级匹配
+
+      ###########################################################################
+      # 3. 代码Lint：cargo clippy（严格模式，警告视为错误）
+      ###########################################################################
+      - name: Run clippy (lint check)
+        uses: actions-rs/clippy-check@v1  # 更友好的PR注释集成
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}  # 自动获取的GitHub令牌
+          args: >-  # 传递给clippy的参数
+            --all-targets  # 检查所有目标（库、二进制、测试、示例）
+            --all-features # 启用所有特性（feature）
+            -- -D warnings  # 把警告（warning）视为错误（error）
+            -D clippy::all  # 启用所有clippy内置规则
+            -D clippy::pedantic  # 启用更严格的规则（可选，按需关闭）
+
+      ###########################################################################
+      # 4. 安全检查：cargo audit（依赖漏洞扫描）
+      ###########################################################################
+      - name: Install cargo-audit
+        run: cargo install cargo-audit  # 安装依赖漏洞检查工具
+
+      - name: Run dependency security audit
+        run: |
+          cargo audit --deny warnings  # 发现漏洞或警告时失败
+          # 可选：忽略特定漏洞（需替换ADVISORY_ID）
+          # cargo audit --ignore ADVISORY_ID --deny warnings
+
+      ###########################################################################
+      # 5. 单元测试：cargo test（全目标+全特性）
+      ###########################################################################
+      - name: Run unit/integration tests
+        run: |
+          cargo test \
+            --all-targets \  # 测试所有目标（包括集成测试）
+            --all-features \ # 启用所有特性
+            --verbose \      # 输出详细日志
+            -- --test-threads=1  # 单线程测试（避免并发测试冲突，可选）
+
+      ###########################################################################
+      # 6. 测试覆盖率：cargo tarpaulin（生成报告+上传Codecov）
+      ###########################################################################
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin  # 安装覆盖率工具
+
+      - name: Generate coverage report
+        run: |
+          cargo tarpaulin \
+            --all-features \  # 启用所有特性
+            --workspace \     # 覆盖整个工作区（多 crate 项目）
+            --out Lcov \      # 输出Lcov格式报告（Codecov支持）
+            --output-dir ./coverage \  # 报告输出目录
+            --exclude-files "tests/*"  # 可选：排除测试文件本身
+            --timeout 120     # 超时时间（秒）
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3  # 上传报告到Codecov（需注册Codecov）
+        with:
+          file: ./coverage/lcov.info  # 报告文件路径
+          token: ${{ secrets.CODECOV_TOKEN }}  # Codecov令牌（仓库Secrets中配置）
+          fail_ci_if_error: true  # 上传失败时视为CI失败（可选）
+          verbose: true  # 输出上传日志
